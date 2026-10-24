@@ -1,0 +1,27 @@
+name: ep-pool-probe
+
+# Manual probe for the EP build pool (Task 60): routes one job through ep-pick and reports where it
+# ran and how long it waited. Used to measure cold start and the two-runs race. No secrets.
+on:
+  workflow_dispatch:
+    inputs:
+      sleep:
+        description: Seconds the job stays busy
+        default: "20"
+
+permissions: {}
+
+jobs:
+  pick:
+    uses: ./.github/workflows/ep-pick.yml
+  work:
+    needs: pick
+    runs-on: ${{ fromJSON(needs.pick.outputs.runs-on) }}
+    steps:
+      - name: Where am I
+        shell: bash
+        env:
+          SLEEP_S: ${{ inputs.sleep }}
+        run: |
+          echo "runner=$RUNNER_NAME labels-route=${{ needs.pick.outputs.runs-on }} started=$(date -u +%FT%TZ) nproc=$(nproc)" | tee -a "$GITHUB_STEP_SUMMARY"
+          sleep "$SLEEP_S"

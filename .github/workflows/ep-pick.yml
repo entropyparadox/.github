@@ -1,0 +1,53 @@
+name: ep-pick
+
+# Reusable workflow: decides where the caller's jobs run (EP build pool, Task 60).
+# Output runs-on is a JSON string for fromJSON(): "ep-linux-x64" (company pool) or "ubuntu-latest".
+# The pick job runs on the warm ep-pick runners and only reads /ep-pool/route, a file the pool
+# publishes every 3 s (listener ready, assigned < max, no runner pending > 10 s). No secrets here.
+# If the file is missing, older than 30 s or malformed, the answer is "ubuntu-latest".
+# Kill-switch: when the repo variable EP_POOL_OFF is "1" (set by the m2 watchdog while the pool
+# host is unreachable), this job itself runs on ubuntu-latest and answers "ubuntu-latest".
+#
+# Caller (a few lines per workflow):
+#   jobs:
+#     pick:
+#       uses: entropyparadox/.github/.github/workflows/ep-pick.yml@<sha>
+#     build:
+#       needs: pick
+#       runs-on: ${{ fromJSON(needs.pick.outputs.runs-on) }}
+on:
+  workflow_call:
+    outputs:
+      runs-on:
+        description: 'JSON string for fromJSON(): "ep-linux-x64" or "ubuntu-latest"'
+        value: ${{ jobs.pick.outputs.runs-on }}
+
+permissions: {}
+
+jobs:
+  pick:
+    runs-on: ${{ vars.EP_POOL_OFF == '1' && 'ubuntu-latest' || 'ep-pick' }}
+    timeout-minutes: 1
+    outputs:
+      runs-on: ${{ steps.pick.outputs.runs-on }}
+    steps:
+      - id: pick
+        shell: bash
+        run: |
+          route='"ubuntu-latest"'
+          why='no pool status (GitHub-hosted picker or missing file)'
+          if [ -r /ep-pool/route ]; then
+            age=$(( $(date +%s) - $(stat -c %Y /ep-pool/route) ))
+            if [ "$age" -le 30 ]; then
+              route=$(head -c 64 /ep-pool/route | tr -d '\n')
+              why="pool status ${age}s old: $(head -c 300 /ep-pool/status.json 2>/dev/null)"
+            else
+              why="pool status stale (${age}s)"
+            fi
+          fi
+          case "$route" in
+            '"ep-linux-x64"'|'"ubuntu-latest"') ;;
+            *) route='"ubuntu-latest"'; why='malformed route file' ;;
+          esac
+          echo "runs-on=$route" >> "$GITHUB_OUTPUT"
+          echo "ep-pick runs-on=$route picker=$RUNNER_NAME reason=$why" | tee -a "$GITHUB_STEP_SUMMARY"
