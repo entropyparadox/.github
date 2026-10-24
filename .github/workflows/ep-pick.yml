@@ -1,26 +1,31 @@
 name: ep-pick
 
-# Reusable workflow: decides where the caller's jobs run (EP build pool, Task 60).
-# Output runs-on is a JSON string for fromJSON(): "ep-linux-x64" (company pool) or "ubuntu-latest".
-# The pick job runs on the warm ep-pick runners and only reads /ep-pool/route, a file the pool
-# publishes every 3 s (listener ready, assigned < max, no runner pending > 10 s). No secrets here.
-# If the file is missing, older than 30 s or malformed, the answer is "ubuntu-latest".
-# Kill-switch: when the repo variable EP_POOL_OFF is "1" (set by the m2 watchdog while the pool
-# host is unreachable), this job itself runs on ubuntu-latest and answers "ubuntu-latest".
+# Reusable workflow: decides where each of the caller's jobs runs (EP build pool, Task 60).
+# The pick job runs on the warm ep-pick runners and only reads two files the pool publishes every 3 s
+# (read-only hostPath /ep-pool):
+#   route      default label for jobs without history: size m "ep-linux-x64", or "ubuntu-latest"
+#   maps.json  per workflow, per job display name: the size its measured history needs
+#              ("ep-linux-x64-s" | "ep-linux-x64" | "ep-linux-x64-l"), or "ubuntu-latest" when that size has no room
+# A missing, malformed or older-than-30 s file means "ubuntu-latest" / no map. No secrets here.
+# Kill-switch: when the repo variable EP_POOL_OFF is "1" (set by the m2 watchdog while the pool host
+# is unreachable), this job itself runs on ubuntu-latest and answers "ubuntu-latest" with an empty map.
 #
-# Caller (a few lines per workflow):
+# Caller (one line per job; index with the job's display name = its `name:`, or the job id when it has none):
 #   jobs:
 #     pick:
 #       uses: entropyparadox/.github/.github/workflows/ep-pick.yml@<sha>
 #     build:
 #       needs: pick
-#       runs-on: ${{ fromJSON(needs.pick.outputs.runs-on) }}
+#       runs-on: ${{ fromJSON(needs.pick.outputs.map)['build'] || fromJSON(needs.pick.outputs.runs-on) }}
 on:
   workflow_call:
     outputs:
       runs-on:
-        description: 'JSON string for fromJSON(): "ep-linux-x64" or "ubuntu-latest"'
+        description: 'JSON string for fromJSON(): "ep-linux-x64" or "ubuntu-latest" (default for jobs without history)'
         value: ${{ jobs.pick.outputs.runs-on }}
+      map:
+        description: 'JSON object {job display name: runs-on label} for this workflow, from measured job history'
+        value: ${{ jobs.pick.outputs.map }}
 
 permissions: {}
 
@@ -30,24 +35,32 @@ jobs:
     timeout-minutes: 1
     outputs:
       runs-on: ${{ steps.pick.outputs.runs-on }}
+      map: ${{ steps.pick.outputs.map }}
     steps:
       - id: pick
         shell: bash
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
         run: |
           route='"ubuntu-latest"'
+          map='{}'
           why='no pool status (GitHub-hosted picker or missing file)'
-          if [ -r /ep-pool/route ]; then
-            age=$(( $(date +%s) - $(stat -c %Y /ep-pool/route) ))
-            if [ "$age" -le 30 ]; then
-              route=$(head -c 64 /ep-pool/route | tr -d '\n')
-              why="pool status ${age}s old: $(head -c 300 /ep-pool/status.json 2>/dev/null)"
-            else
-              why="pool status stale (${age}s)"
+          fresh() { [ -r "$1" ] && [ $(( $(date +%s) - $(stat -c %Y "$1") )) -le 30 ]; }
+          if fresh /ep-pool/route; then
+            route=$(head -c 64 /ep-pool/route | tr -d '\n')
+            why="pool status: $(head -c 400 /ep-pool/status.json 2>/dev/null)"
+            if fresh /ep-pool/maps.json; then
+              map=$(jq -c --arg k "${WORKFLOW_REF%%@*}" \
+                '(.[$k] // {}) | with_entries(select(.value | test("^(ep-linux-x64(-s|-l)?|ubuntu-latest)$")))' \
+                /ep-pool/maps.json) || map='{}'
             fi
+          elif [ -r /ep-pool/route ]; then
+            why='pool status stale'
           fi
           case "$route" in
             '"ep-linux-x64"'|'"ubuntu-latest"') ;;
-            *) route='"ubuntu-latest"'; why='malformed route file' ;;
+            *) route='"ubuntu-latest"'; map='{}'; why='malformed route file' ;;
           esac
           echo "runs-on=$route" >> "$GITHUB_OUTPUT"
-          echo "ep-pick runs-on=$route picker=$RUNNER_NAME reason=$why" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "map=$map" >> "$GITHUB_OUTPUT"
+          echo "ep-pick workflow=${WORKFLOW_REF%%@*} runs-on=$route map=$map picker=$RUNNER_NAME reason=$why" | tee -a "$GITHUB_STEP_SUMMARY"
