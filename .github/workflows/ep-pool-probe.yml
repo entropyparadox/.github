@@ -1,7 +1,7 @@
 name: ep-pool-probe
 
 # Manual probe for the EP build pool (Task 60): one light and one heavy job routed through ep-pick.
-# Shows where each job ran (by size, from measured history) and how long it waited. No secrets.
+# Shows where each job ran (grid combo from measured history or the sizes input) and how long it waited. No secrets.
 on:
   workflow_dispatch:
     inputs:
@@ -14,12 +14,17 @@ on:
       fail:
         description: Make the heavy job fail at the end (to test the OOM re-run path)
         default: "false"
+      sizes:
+        description: Optional ep-pick sizes, e.g. {"light":"cpu=2/ram=4"}
+        default: "{}"
 
 permissions: {}
 
 jobs:
   pick:
     uses: ./.github/workflows/ep-pick.yml
+    with:
+      sizes: ${{ inputs.sizes }}
   light:
     needs: pick
     runs-on: ${{ fromJSON(needs.pick.outputs.map)['light'] || fromJSON(needs.pick.outputs.runs-on) }}

@@ -1,30 +1,43 @@
 name: ep-pick
 
-# Reusable workflow: decides where each of the caller's jobs runs (EP build pool, Task 60).
-# The pick job runs on the warm ep-pick runners and only reads two files the pool publishes every 3 s
-# (read-only hostPath /ep-pool):
-#   route      default label for jobs without history: size m "ep-linux-x64", or "ubuntu-latest"
-#   maps.json  per workflow, per job display name: the size its measured history needs
-#              ("ep-linux-x64-s" | "ep-linux-x64" | "ep-linux-x64-l"), or "ubuntu-latest" when that size has no room
-# A missing, malformed or older-than-30 s file means "ubuntu-latest" / no map. No secrets here.
+# Reusable workflow: decides where each of the caller's jobs runs (EP build pool, Task 60). v3: CPU/memory grid.
+# The pick job runs on the warm ep-pick runners and reads one file the pool publishes every 3 s
+# (read-only hostPath /ep-pool/grid.json):
+#   grid       the CPU (cores) and memory (GiB) steps the pool offers
+#   default    combo for jobs without history (e.g. "ep-c0p5-m8" = 0.5 CPU / 8 GiB)
+#   combos     state per existing combo scale set: "ok" (usable now) or why not
+#   workflows  per workflow, per job display name: the combo its measured history needs
+# A combo is a scale set named ep-c<cpu>-m<GiB> (0.5 written 0p5); its requests are those values, no limits.
+# When a needed combo does not exist yet, the picker asks the pool for it (an empty file in the writable
+# /ep-pool-want) and waits up to 45 s for it to become usable. A job whose combo is not "ok" in time gets
+# "ubuntu-latest". A missing, malformed or older-than-30 s grid.json means "ubuntu-latest" / no map.
 # Kill-switch: when the repo variable EP_POOL_OFF is "1" (set by the m2 watchdog while the pool host
 # is unreachable), this job itself runs on ubuntu-latest and answers "ubuntu-latest" with an empty map.
+# Callers pinned to 6c703f18 (v2) keep the legacy labels ep-linux-x64(-s|-l) from route / maps.json.
 #
 # Caller (one line per job; index with the job's display name = its `name:`, or the job id when it has none):
 #   jobs:
 #     pick:
 #       uses: entropyparadox/.github/.github/workflows/ep-pick.yml@<sha>
+#       # optional, wins over measured history; values snap up to the grid; either part may be left out:
+#       # with:
+#       #   sizes: '{"build": "cpu=4/ram=16"}'
 #     build:
 #       needs: pick
 #       runs-on: ${{ fromJSON(needs.pick.outputs.map)['build'] || fromJSON(needs.pick.outputs.runs-on) }}
 on:
   workflow_call:
+    inputs:
+      sizes:
+        description: 'Optional JSON {job display name: "cpu=<cores>/ram=<GiB>"}; snapped up to the pool grid, wins over history'
+        type: string
+        default: '{}'
     outputs:
       runs-on:
-        description: 'JSON string for fromJSON(): "ep-linux-x64" or "ubuntu-latest" (default for jobs without history)'
+        description: 'JSON string for fromJSON(): the default combo or "ubuntu-latest" (for jobs without history)'
         value: ${{ jobs.pick.outputs.runs-on }}
       map:
-        description: 'JSON object {job display name: runs-on label} for this workflow, from measured job history'
+        description: 'JSON object {job display name: runs-on label} for this workflow, from history and `sizes`'
         value: ${{ jobs.pick.outputs.map }}
 
 permissions: {}
@@ -32,7 +45,7 @@ permissions: {}
 jobs:
   pick:
     runs-on: ${{ vars.EP_POOL_OFF == '1' && 'ubuntu-latest' || 'ep-pick' }}
-    timeout-minutes: 1
+    timeout-minutes: 2
     outputs:
       runs-on: ${{ steps.pick.outputs.runs-on }}
       map: ${{ steps.pick.outputs.map }}
@@ -41,26 +54,65 @@ jobs:
         shell: bash
         env:
           WORKFLOW_REF: ${{ github.workflow_ref }}
+          SIZES: ${{ inputs.sizes }}
         run: |
+          grid=/ep-pool/grid.json
+          want=/ep-pool-want
+          combo_re='^ep-c[0-9]+(p5)?-m[0-9]+(p5)?$'
+          wf=${WORKFLOW_REF%%@*}
           route='"ubuntu-latest"'
           map='{}'
           why='no pool status (GitHub-hosted picker or missing file)'
           fresh() { [ -r "$1" ] && [ $(( $(date +%s) - $(stat -c %Y "$1") )) -le 30 ]; }
-          if fresh /ep-pool/route; then
-            route=$(head -c 64 /ep-pool/route | tr -d '\n')
-            why="pool status: $(head -c 400 /ep-pool/status.json 2>/dev/null)"
-            if fresh /ep-pool/maps.json; then
-              map=$(jq -c --arg k "${WORKFLOW_REF%%@*}" \
-                '(.[$k] // {}) | with_entries(select(.value | test("^(ep-linux-x64(-s|-l)?|ubuntu-latest)$")))' \
-                /ep-pool/maps.json) || map='{}'
+          # Wanted combo per job: history, then `sizes` overrides snapped up to the grid (a missing part
+          # keeps the history or default value). Malformed `sizes` entries are ignored.
+          desire='
+            def snap($x; $l): ([$l[] | select(. >= $x)] | first) // ($l | last);
+            def fmt: if . == floor then tostring else (tostring | sub("\\."; "p")) end;
+            def parse: capture("^ep-c(?<c>[0-9]+(p5)?)-m(?<m>[0-9]+(p5)?)$") | map_values(sub("p"; ".") | tonumber);
+            . as $g
+            | (try ($sizes | fromjson) catch {}) as $ov
+            | ($g.workflows[$wf] // {}) as $hist
+            | {default: $g.default,
+               jobs: ($hist + (if ($ov | type) == "object" then $ov else {} end
+                 | with_entries(select(.value | type == "string") | .key as $k | .value |= (
+                     ([split("/")[] | ascii_downcase | gsub("\\s"; "")
+                       | capture("^(?<k>cpu|ram)=(?<v>[0-9]+(\\.[0-9]+)?)$") | {(.k): (.v | tonumber)}] | add // {}) as $o
+                     | (($hist[$k] // $g.default) | parse) as $b
+                     | "ep-c\(snap($o.cpu // $b.c; $g.grid.cpu) | fmt)-m\(snap($o.ram // $b.m; $g.grid.mem) | fmt)"))))}'
+          # Combos still missing or being created
+          pending='. as $g | [$d.default, $d.jobs[]] | map(select(type == "string")) | unique
+            | map(select(($g.combos[.] // "absent") as $s | $s == "absent" or $s == "creating")) | .[]'
+          if fresh "$grid" && d=$(jq -c --arg wf "$wf" --arg sizes "$SIZES" "$desire" "$grid" 2>/dev/null) \
+              && [ -n "$d" ] && [ "$(jq -r '.default | type' <<<"$d")" = string ]; then
+            for i in $(seq 1 16); do
+              fresh "$grid" || break
+              waiting=$(jq -r --argjson d "$d" "$pending" "$grid") || waiting=
+              [ -z "$waiting" ] && break
+              for c in $waiting; do
+                if [[ $c =~ $combo_re ]] && [ "$(jq -r --arg c "$c" '.combos[$c] // "absent"' "$grid")" = absent ] \
+                    && [ -d "$want" ] && [ -w "$want" ]; then
+                  : > "$want/$c"
+                fi
+              done
+              [ "$i" = 1 ] && echo "ep-pick waiting for combo(s): $(tr '\n' ' ' <<<"$waiting")"
+              [ "$i" = 16 ] || sleep 3
+            done
+            if fresh "$grid"; then
+              route=$(jq -c --argjson d "$d" '.combos[$d.default] as $s | if $s == "ok" then $d.default else "ubuntu-latest" end' "$grid")
+              map=$(jq -c --argjson d "$d" '.combos as $c | $d.jobs | map_values(if $c[.] == "ok" then . else "ubuntu-latest" end)' "$grid")
+              states=$(jq -c --argjson d "$d" '. as $g | [$d.default, $d.jobs[]] | unique | map({(.): ($g.combos[.] // "absent")}) | add' "$grid") || states=
+              why="pool grid: ${states:0:600}"
+            else
+              why='pool status stale'
             fi
-          elif [ -r /ep-pool/route ]; then
-            why='pool status stale'
+          elif [ -r "$grid" ]; then
+            why='pool status stale or malformed'
           fi
-          case "$route" in
-            '"ep-linux-x64"'|'"ubuntu-latest"') ;;
-            *) route='"ubuntu-latest"'; map='{}'; why='malformed route file' ;;
-          esac
+          if ! jq -e --arg re "$combo_re" 'type == "string" and (test($re) or . == "ubuntu-latest")' <<<"$route" >/dev/null 2>&1; then
+            route='"ubuntu-latest"'; map='{}'; why='malformed answer'
+          fi
+          map=$(jq -c --arg re "$combo_re" 'with_entries(select(.value | type == "string" and (test($re) or . == "ubuntu-latest")))' <<<"$map" 2>/dev/null) || map='{}'
           echo "runs-on=$route" >> "$GITHUB_OUTPUT"
           echo "map=$map" >> "$GITHUB_OUTPUT"
-          echo "ep-pick workflow=${WORKFLOW_REF%%@*} runs-on=$route map=$map picker=$RUNNER_NAME reason=$why" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "ep-pick workflow=$wf runs-on=$route map=$map sizes=$(head -c 300 <<<"$SIZES") picker=$RUNNER_NAME reason=$why" | tee -a "$GITHUB_STEP_SUMMARY"
