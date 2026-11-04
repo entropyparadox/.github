@@ -10,7 +10,10 @@ name: ep-pick
 # A combo is a scale set named ep-c<cpu>-m<GiB> (0.5 written 0p5); its requests are those values, no limits.
 # When a needed combo does not exist yet, the picker asks the pool for it (an empty file in the writable
 # /ep-pool-want) and waits up to 45 s for it to become usable. A job whose combo is not "ok" in time gets
-# "ubuntu-latest". A missing, malformed or older-than-30 s grid.json means "ubuntu-latest" / no map.
+# "ubuntu-latest". A combo that exists but is full (no node has room / runner pod pending) is waited for up to
+# room-wait-seconds (default 180, max 300; CTO 2026-11-04 "전부다 개선해주세요": a pool job is cheaper than a
+# GitHub-hosted one, so a run may start up to 3 min later). The wait covers every combo in this workflow's map,
+# also jobs that will not run this time. A missing, malformed or older-than-30 s grid.json means "ubuntu-latest" / no map.
 # Kill-switch: when the repo variable EP_POOL_OFF is "1" (set by the m2 watchdog while the pool host
 # is unreachable), this job itself runs on ubuntu-latest and answers "ubuntu-latest" with an empty map.
 # Callers pinned to 6c703f18 (v2) keep the legacy labels ep-linux-x64(-s|-l) from route / maps.json.
@@ -32,6 +35,10 @@ on:
         description: 'Optional JSON {job display name: "cpu=<cores>/ram=<GiB>"}; snapped up to the pool grid, wins over history'
         type: string
         default: '{}'
+      room-wait-seconds:
+        description: 'Seconds (max 300) to wait for room when a wanted combo is full (no node has room / runner pod pending) before falling back to ubuntu-latest. 0 = no wait.'
+        type: number
+        default: 180
     outputs:
       runs-on:
         description: 'JSON string for fromJSON(): the default combo or "ubuntu-latest" (for jobs without history)'
@@ -45,7 +52,7 @@ permissions: {}
 jobs:
   pick:
     runs-on: ${{ vars.EP_POOL_OFF == '1' && 'ubuntu-latest' || 'ep-pick' }}
-    timeout-minutes: 2
+    timeout-minutes: 6
     outputs:
       runs-on: ${{ steps.pick.outputs.runs-on }}
       map: ${{ steps.pick.outputs.map }}
@@ -55,6 +62,7 @@ jobs:
         env:
           WORKFLOW_REF: ${{ github.workflow_ref }}
           SIZES: ${{ inputs.sizes }}
+          ROOM_WAIT: ${{ inputs.room-wait-seconds }}
         run: |
           grid=/ep-pool/grid.json
           want=/ep-pool-want
@@ -97,6 +105,17 @@ jobs:
               done
               [ "$i" = 1 ] && echo "ep-pick waiting for combo(s): $(tr '\n' ' ' <<<"$waiting")"
               [ "$i" = 16 ] || sleep 3
+            done
+            # Room wait: combos that exist but are full (not "ok", not creating) get up to ROOM_WAIT s.
+            full='. as $g | [$d.default, $d.jobs[]] | map(select(type == "string")) | unique
+              | map(select(($g.combos[.] // "absent") as $s | $s != "ok" and $s != "absent" and $s != "creating")) | .[]'
+            room_wait=${ROOM_WAIT%%.*}; [[ $room_wait =~ ^[0-9]+$ ]] || room_wait=0; [ "$room_wait" -le 300 ] || room_wait=300
+            waited=0
+            while [ "$waited" -lt "$room_wait" ] && fresh "$grid"; do
+              busy=$(jq -r --argjson d "$d" "$full" "$grid") || busy=
+              [ -z "$busy" ] && break
+              [ "$waited" = 0 ] && echo "ep-pick waiting up to ${room_wait}s for room: $(tr '\n' ' ' <<<"$busy")"
+              sleep 5; waited=$((waited + 5))
             done
             if fresh "$grid"; then
               route=$(jq -c --argjson d "$d" '.combos[$d.default] as $s | if $s == "ok" then $d.default else "ubuntu-latest" end' "$grid")
